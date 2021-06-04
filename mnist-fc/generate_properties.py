@@ -1,16 +1,19 @@
 
 import os
-import argparse
+import sys
+
 
 import torch
 import torchvision.datasets as dset
 import torchvision.transforms as trans
 from torch.utils.data import DataLoader
 from torch.utils.data import sampler
+import numpy as np
+import onnxruntime as onnxrun
 
 
 # noinspection PyShadowingNames
-def load_data(data_dir: str = "./tmp", num_imgs: int = 25, random: bool = False) -> tuple:
+def load_data(data_dir: str = "./tmp", num_imgs: int = 25, random: bool = True) -> tuple:
 
     """
     Loads the mnist data.
@@ -34,12 +37,43 @@ def load_data(data_dir: str = "./tmp", num_imgs: int = 25, random: bool = False)
     mnist_test = dset.MNIST(data_dir, train=False, download=True, transform=trns_norm)
 
     if random:
-        loader_test = DataLoader(mnist_test, batch_size=num_imgs,
+        loader_test = DataLoader(mnist_test, batch_size=10000,
                                  sampler=sampler.SubsetRandomSampler(range(10000)))
     else:
-        loader_test = DataLoader(mnist_test, batch_size=num_imgs)
+        loader_test = DataLoader(mnist_test, batch_size=10000)
 
-    return next(iter(loader_test))
+    images, labels = next(iter(loader_test))
+
+    num_selected = 0
+    selected_images, selected_labels = [], []
+
+    sess1 = onnxrun.InferenceSession("./mnist-net_256x2.onnx")
+    sess2 = onnxrun.InferenceSession("./mnist-net_256x4.onnx")
+    sess3 = onnxrun.InferenceSession("./mnist-net_256x6.onnx")
+    sessions = [sess1, sess2, sess3]
+
+    i = -1
+    while num_selected < num_imgs:
+
+        i += 1
+        correctly_classified = True
+
+        for sess in sessions:
+            input_name = sess.get_inputs()[0].name
+            result = np.argmax(sess.run(None, {input_name: images[i].numpy().reshape(1, 784, 1)})[0])
+
+            if result != labels[i]:
+                correctly_classified = False
+                break
+
+        if not correctly_classified:
+            continue
+
+        num_selected += 1
+        selected_images.append(images[i])
+        selected_labels.append(labels[i])
+
+    return selected_images, selected_labels
 
 
 def create_input_bounds(img: torch.Tensor, eps: float) -> torch.Tensor:
@@ -111,42 +145,64 @@ def save_vnnlib(input_bounds: torch.Tensor, label: int, spec_path: str, total_ou
 
         # Define output constraints.
         f.write(f"; Output constraints:\n")
+        f.write("(assert (or\n")
         for i in range(total_output_class):
             if i != label:
-                f.write(f"(assert (>= Y_{label} Y_{i}))\n")
-        f.write("\n")
+                f.write(f"    (<= Y_{i} Y_{label})\n")
+        f.write("))")
+
+
+def create_instances_csv(num_props: int = 15, path: str = "mnistfc_instances.csv"):
+
+    """
+    Creates the instances_csv file.
+
+    Args:
+        num_props:
+            The number of properties.
+        path:
+            The path of the csv file.
+    """
+
+    nets = ["mnist-net_256x2.onnx",
+            "mnist-net_256x4.onnx",
+            "mnist-net_256x6.onnx"]
+
+    props = [f"prop_{i}_0.03.vnnlib" for i in range(num_props)]
+    props += [f"prop_{i}_0.05.vnnlib" for i in range(num_props)]
+
+    with open(path, "w") as f:
+
+        for net in nets:
+            timeout = 120 if net == "mnist-net_256x2.onnx" else 300
+            for prop in props:
+
+                if net == nets[-1] and prop == props[-1]:
+                    f.write(f"{net},{prop},{timeout}")
+                else:
+                    f.write(f"{net},{prop},{timeout}\n")
 
 
 if __name__ == '__main__':
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--num_images', type=int, default=25)
-    parser.add_argument('--random', type=bool, default=False)
-    parser.add_argument('--epsilons', type=str, default="0.02 0.03 0.05")
-    args = parser.parse_args()
+    num_images = 15
+    epsilons = [0.03, 0.05]
 
     try:
-        num_imgs = args.num_images
-        random = args.random
-        epsilons = [float(eps) for eps in args.epsilons.split(" ")]
-    except ValueError:
-        msg = "Error, usage: $python generate_properties --num_images <int> --random <bool> --epsilons <str> \n"
-        msg += "Example: $python generate_properties --num_images 25 --random True --epsilons '0.03 0.05'"
-        raise ValueError(msg)
+        torch.random.manual_seed(int(sys.argv[1]))
+    except (IndexError, ValueError):
+        raise ValueError("Expected seed (int) to be given as command line argument")
 
-    result_dir = "./vnnlib_properties"
-
-    if not os.path.isdir(result_dir):
-        os.mkdir(result_dir)
-
-    images, labels = load_data(num_imgs=num_imgs, random=random)
+    images, labels = load_data(num_imgs=num_images, random=True)
 
     for eps in epsilons:
-        for i in range(num_imgs):
+        for i in range(num_images):
 
             image, label = images[i], labels[i]
             input_bounds = create_input_bounds(image, eps)
 
-            spec_path = f"vnnlib_properties/prop_{i}_eps_{eps:.2f}.vnnlib"
+            spec_path = f"prop_{i}_{eps:.2f}.vnnlib"
 
             save_vnnlib(input_bounds, label, spec_path)
+
+    create_instances_csv()
